@@ -1,10 +1,11 @@
 [package]
 name = "async-xpty"
-version = "0.3.4"
+version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Cross-platform async PTY for tokio"
-repository = "https://github.com/khiops/termora"
+repository = "https://github.com/khiops/async-xpty"
+readme = "README.md"
 keywords = ["pty", "terminal", "async", "tokio", "cross-platform"]
 categories = ["asynchronous", "os"]
 
