@@ -459,6 +459,25 @@ fn create_cloexec_pipe() -> io::Result<(RawFd, RawFd)> {
     Ok((fds[0], fds[1]))
 }
 
+/// Point the process environment at `envp` (the array used by the subsequent
+/// `execvp`), replacing glibc's non-portable `execvpe`.
+///
+/// Only a pointer store happens here, so it is safe to call after `fork()` in
+/// the child (async-signal-safe).
+#[cfg(target_os = "linux")]
+unsafe fn set_environ(envp: *const *const libc::c_char) {
+    extern "C" {
+        static mut environ: *mut *mut libc::c_char;
+    }
+    environ = envp as *mut *mut libc::c_char;
+}
+
+/// macOS/BSD expose the real `environ` pointer indirectly via `_NSGetEnviron()`.
+#[cfg(not(target_os = "linux"))]
+unsafe fn set_environ(envp: *const *const libc::c_char) {
+    *libc::_NSGetEnviron() = envp as *mut *mut libc::c_char;
+}
+
 /// Child-side setup: session, controlling terminal, stdio, env, exec.
 ///
 /// # Safety
@@ -520,7 +539,13 @@ unsafe fn child_setup(
 
     // argv_ptrs and envp_ptrs are pre-built NULL-terminated pointer arrays
     // constructed before the fork — no allocation occurs here.
-    libc::execvpe(argv_ptrs[0], argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+    //
+    // `execvpe` is a glibc extension absent on macOS/BSD, so we replicate it
+    // portably: point `environ` at our pre-built env, then `execvp`, which does
+    // the PATH search using that same environment. Both steps are
+    // async-signal-safe (a pointer store followed by exec).
+    set_environ(envp_ptrs.as_ptr());
+    libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
 
     // If we reach here, exec failed
     let err = io::Error::last_os_error()
