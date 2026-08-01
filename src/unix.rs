@@ -11,6 +11,7 @@ use std::ffi::{CString, NulError};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -20,7 +21,7 @@ use nix::unistd::Pid;
 use tokio::io::ReadBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{CommandBuilder, ExitStatus, PtySize};
+use crate::{CommandBuilder, ExitStatus, KillTreeScope, PtySize};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -114,6 +115,9 @@ impl MasterFd {
 pub struct UnixPtyProcess {
     master: Arc<MasterFd>,
     pid: Pid,
+    /// True once this instance's `wait()` has reaped the child, after which its
+    /// PID is unsafe to signal because the OS may reuse it.
+    reaped: AtomicBool,
 }
 
 impl UnixPtyProcess {
@@ -144,8 +148,12 @@ impl UnixPtyProcess {
         // block the executor. A small delay keeps CPU usage low.
         loop {
             match waitpid(self.pid, Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::Exited(_, code)) => return Ok(ExitStatus::from_code(code)),
+                Ok(WaitStatus::Exited(_, code)) => {
+                    self.reaped.store(true, Ordering::SeqCst);
+                    return Ok(ExitStatus::from_code(code));
+                }
                 Ok(WaitStatus::Signaled(_, sig, _)) => {
+                    self.reaped.store(true, Ordering::SeqCst);
                     return Ok(ExitStatus::from_signal(sig as i32));
                 }
                 Ok(WaitStatus::StillAlive) => {
@@ -155,6 +163,10 @@ impl UnixPtyProcess {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 Err(nix::errno::Errno::EINTR) => continue,
+                Err(nix::errno::Errno::ECHILD) => {
+                    self.reaped.store(true, Ordering::SeqCst);
+                    return Err(io::Error::from_raw_os_error(libc::ECHILD));
+                }
                 Err(e) => {
                     return Err(io::Error::from_raw_os_error(e as i32));
                 }
@@ -166,10 +178,65 @@ impl UnixPtyProcess {
         self.pid.as_raw() as u32
     }
 
+    pub fn kill_tree_scope(&self) -> KillTreeScope {
+        KillTreeScope::ProcessGroup
+    }
+
     pub fn kill(&self) -> io::Result<()> {
+        self.ensure_not_reaped()?;
         let rc = unsafe { libc::kill(self.pid.as_raw(), libc::SIGKILL) };
         if rc == -1 {
             Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Kill the child's original process group.
+    ///
+    /// `child_setup()` makes the child the group leader, so this reaches group
+    /// members that this process is permitted to signal. A successful `kill`
+    /// only means the signal reached at least one permitted member; it does not
+    /// prove every group member is gone. A child which calls `setsid()` first
+    /// is in a different group and survives.
+    pub fn kill_tree(&self) -> io::Result<()> {
+        self.ensure_not_reaped()?;
+
+        // SAFETY: `pid` comes from a successful fork and libc::kill has no
+        // pointer arguments. A negative PID targets that process group.
+        let rc = unsafe { libc::kill(-self.pid.as_raw(), libc::SIGKILL) };
+        if rc == 0 {
+            return Ok(());
+        }
+
+        let group_error = io::Error::last_os_error();
+        if group_error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(group_error);
+        }
+
+        // The child may have left its original group. ESRCH here means the
+        // requested group is already dead.
+        // SAFETY: `pid` comes from a successful fork and libc::kill has no
+        // pointer arguments.
+        let rc = unsafe { libc::kill(self.pid.as_raw(), libc::SIGKILL) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            let child_error = io::Error::last_os_error();
+            if child_error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(child_error)
+            }
+        }
+    }
+
+    fn ensure_not_reaped(&self) -> io::Result<()> {
+        if self.reaped.load(Ordering::SeqCst) {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot signal a PTY child after this instance's wait() observed its exit",
+            ))
         } else {
             Ok(())
         }
@@ -429,6 +496,7 @@ pub async fn spawn(cmd: CommandBuilder) -> io::Result<UnixPtyProcess> {
             Ok(UnixPtyProcess {
                 master,
                 pid: Pid::from_raw(child_pid),
+                reaped: AtomicBool::new(false),
             })
         }
     }

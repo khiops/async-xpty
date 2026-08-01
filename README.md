@@ -13,7 +13,8 @@ inside a pseudo-terminal (PTY). It is built on top of tokio and targets:
 - **Windows** via ConPTY (Windows 10 1809+)
 
 The PTY master is exposed as tokio `AsyncRead` / `AsyncWrite` halves, with async
-`resize`, `wait`, `kill`, and a builder for spawning.
+`resize` and `wait`, synchronous `kill` and `kill_tree`, and a builder for
+spawning.
 
 ## Quick start
 
@@ -49,7 +50,7 @@ async fn main() -> std::io::Result<()> {
 ## API overview
 
 - [`CommandBuilder`] — configure and `spawn()` a process attached to a PTY.
-- [`PtyProcess`] — the running child; `reader()`, `writer()`, `resize()`, `wait()`, `pid()`, `kill()`.
+- [`PtyProcess`] — the running child; `reader()`, `writer()`, `resize()`, `wait()`, `pid()`, `kill()`, `kill_tree()`, `kill_tree_scope()`.
 - [`PtyReader`] / [`PtyWriter`] — tokio `AsyncRead` / `AsyncWrite` halves over the PTY master.
 - [`PtySize`] — window dimensions (cols × rows).
 - [`ExitStatus`] — child exit code or terminating signal.
@@ -57,6 +58,15 @@ async fn main() -> std::io::Result<()> {
 ## Platform notes
 
 - **Resize** sends `SIGWINCH` to the process group on Unix; calls `ResizePseudoConsole` on Windows.
+- **`kill_tree_scope()`** reports whether `kill_tree()` reaches a Windows job's
+  whole tree, the child's Unix process group, or only a direct Windows child.
+  The whole-tree scope remains valid after `wait()` and is torn down when its
+  `PtyProcess` is dropped, unless the workload retained a handle to its job.
+- **`kill()` / `kill_tree()`** on Unix reject signalling after this instance's
+  `wait()` has observed exit, including `ECHILD`; this is not protection
+  against PID reuse. A successful group signal does not mean every member is
+  gone, and descendants that call `setsid()` escape it. On Windows, `kill()`
+  fails for an exited process.
 - **Windows** requires the ConPTY API (Windows 10 1809 / build 17763 or newer).
 
 ## License

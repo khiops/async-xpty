@@ -59,6 +59,25 @@ impl Default for PtySize {
     }
 }
 
+/// The processes that [`PtyProcess::kill_tree`] can reach.
+///
+/// This enum is exhaustive: each variant describes one of the containment
+/// mechanisms used by this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillTreeScope {
+    /// The child and its descendants in a Windows job.
+    WholeTree,
+    /// Members of the child's original Unix process group.
+    ///
+    /// A descendant that leaves that group, for example with `setsid()`, is
+    /// not reached.
+    ProcessGroup,
+    /// Only the direct child process.
+    ///
+    /// Windows reports this when job containment was unavailable at spawn.
+    DirectProcess,
+}
+
 /// The exit status of a PTY child process.
 ///
 /// Exactly one of `code` or `signal` will be `Some` after a normal exit.
@@ -118,6 +137,21 @@ impl std::fmt::Display for ExitStatus {
 /// Provides async reader/writer halves and methods to resize, wait for exit,
 /// and kill the child process.
 ///
+/// [`Self::kill_tree_scope`] reports whether [`Self::kill_tree`] reaches a
+/// Windows job's whole tree, the child's Unix process group, or only a direct
+/// Windows child. Dropping this value tears down the whole tree only for
+/// [`KillTreeScope::WholeTree`], unless the workload has retained a handle to
+/// its own job; it does not signal the other scopes.
+///
+/// On Unix, [`Self::kill`] and [`Self::kill_tree`] reject signalling after this
+/// instance's [`Self::wait`] has observed exit, including `ECHILD`. This catches
+/// the local wait-then-signal mistake; it is not a safety mechanism against PID
+/// reuse. Callers that reap children by other means own that hazard, just as
+/// they would when calling `libc::kill` themselves. On Windows,
+/// [`Self::kill_tree`] remains valid after `wait()` when its scope is
+/// [`KillTreeScope::WholeTree`], because it targets an owned job handle, but
+/// [`Self::kill`] on an exited process fails.
+///
 /// Obtained by calling [`CommandBuilder::spawn`].
 pub struct PtyProcess {
     #[cfg(unix)]
@@ -164,13 +198,31 @@ impl PtyProcess {
         self.inner.pid()
     }
 
+    /// Returns the processes [`Self::kill_tree`] can reach.
+    pub fn kill_tree_scope(&self) -> KillTreeScope {
+        self.inner.kill_tree_scope()
+    }
+
     /// Send `SIGKILL` to the child process on Unix, or `TerminateProcess` on
     /// Windows.
+    ///
+    /// On Windows, this targets an owned process handle. It fails for a
+    /// process that has already exited, including after [`Self::wait`].
     ///
     /// Prefer [`wait`](Self::wait) after writing an EOF or shell exit command
     /// for a graceful shutdown.
     pub fn kill(&self) -> io::Result<()> {
         self.inner.kill()
+    }
+
+    /// Forcefully end the terminal workload.
+    ///
+    /// The reach is reported by [`Self::kill_tree_scope`]. A successful Unix
+    /// call only means a signal was delivered, not that every process in the
+    /// group is gone. On Windows, the whole-tree scope remains valid after
+    /// [`Self::wait`] because it targets an owned job handle.
+    pub fn kill_tree(&self) -> io::Result<()> {
+        self.inner.kill_tree()
     }
 }
 

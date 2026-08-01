@@ -31,22 +31,27 @@ use tokio::task;
 
 use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, S_OK,
+    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, S_OK,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, GetStdHandle, ResizePseudoConsole, COORD, HPCON,
     STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows_sys::Win32::System::JobObjects::{
+    CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
     InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOEXW,
 };
 
-use crate::{CommandBuilder, ExitStatus, PtySize};
+use crate::{CommandBuilder, ExitStatus, KillTreeScope, PtySize};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -58,6 +63,9 @@ use crate::{CommandBuilder, ExitStatus, PtySize};
 /// rather than depending on a feature flag that may not be stable across
 /// `windows-sys` versions.
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
+
+/// `PROC_THREAD_ATTRIBUTE_JOB_LIST` attribute identifier.
+const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000D;
 
 /// The DSR sequence ConPTY injects. Detecting this prevents a deadlock.
 const DSR_QUERY: &[u8] = b"\x1b[6n";
@@ -83,8 +91,54 @@ unsafe impl Sync for SendHandle {}
 impl Drop for SendHandle {
     fn drop(&mut self) {
         if self.0 != INVALID_HANDLE_VALUE && !self.0.is_null() {
+            // SAFETY: this wrapper exclusively owns a valid, closable HANDLE.
             unsafe { CloseHandle(self.0) };
         }
+    }
+}
+
+/// Duplicate a handle so a blocking waiter has an independently valid owner.
+fn duplicate_handle(handle: HANDLE) -> io::Result<SendHandle> {
+    let mut duplicate = INVALID_HANDLE_VALUE;
+    // SAFETY: `handle` is a valid handle owned by this process, the current
+    // process pseudo-handles are valid for DuplicateHandle, and `duplicate` is
+    // writable for the duration of the call.
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(SendHandle(duplicate))
+    }
+}
+
+/// Wait for a process using an independently owned handle.
+fn wait_for_exit(wait_handle: SendHandle) -> io::Result<ExitStatus> {
+    let h = wait_handle.0;
+    // SAFETY: `wait_handle` owns an independent duplicate that remains open
+    // until this function returns.
+    let wait_result = unsafe { WaitForSingleObject(h, INFINITE) };
+    // WAIT_OBJECT_0 == 0; anything else is an error.
+    if wait_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut exit_code: u32 = 0;
+    // SAFETY: `wait_handle` remains open and `exit_code` is writable for the
+    // duration of this call.
+    let ok = unsafe { GetExitCodeProcess(h, &mut exit_code) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ExitStatus::from_code(exit_code as i32))
     }
 }
 
@@ -135,13 +189,14 @@ impl Drop for SendHpcon {
 
 /// Cast a `HANDLE` (`*mut c_void`) to `usize` for cross-thread capture.
 ///
-/// `usize` is `Send + 'static` unconditionally. We cast back to `HANDLE`
-/// inside the closure. Windows kernel objects are reference-counted by the
-/// kernel and safe to use from any thread.
-///
 /// # Safety
-/// The caller must ensure the handle remains valid for the lifetime of all
-/// threads that hold a copy of this value.
+///
+/// The cast creates no reference on the kernel object. Every holder of a copy
+/// must not outlive the owner's close; issue [#3] tracks the pipe pumps that
+/// currently violate this requirement.
+///
+/// [#3]: https://github.com/khiops/async-xpty/issues/3
+///
 #[inline(always)]
 fn handle_as_usize(h: HANDLE) -> usize {
     h as usize
@@ -167,6 +222,11 @@ pub struct WinPtyProcess {
     hpc: Arc<SendHpcon>,
     /// The child process handle.
     process_handle: SendHandle,
+    /// The job that contains the child and all of its descendants when
+    /// containment was available at spawn time.
+    job_handle: Option<SendHandle>,
+    /// What `kill_tree()` can actually terminate for this process.
+    kill_tree_scope: KillTreeScope,
     /// The child process ID.
     process_id: u32,
     /// Shared receiver so `reader()` can be called multiple times.
@@ -221,23 +281,10 @@ impl WinPtyProcess {
 
     /// Wait for the child process to exit and return its [`ExitStatus`].
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        let raw_handle = handle_as_usize(self.process_handle.0);
-        task::spawn_blocking(move || {
-            let h = usize_as_handle(raw_handle);
-            let wait_result = unsafe { WaitForSingleObject(h, INFINITE) };
-            // WAIT_OBJECT_0 == 0; anything else is an error.
-            if wait_result != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut exit_code: u32 = 0;
-            let ok = unsafe { GetExitCodeProcess(h, &mut exit_code) };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(ExitStatus::from_code(exit_code as i32))
-        })
-        .await
-        .map_err(io::Error::other)?
+        let wait_handle = duplicate_handle(self.process_handle.0)?;
+        task::spawn_blocking(move || wait_for_exit(wait_handle))
+            .await
+            .map_err(io::Error::other)?
     }
 
     /// Returns the OS process ID of the child.
@@ -245,13 +292,46 @@ impl WinPtyProcess {
         self.process_id
     }
 
+    /// Returns what [`Self::kill_tree`] can terminate for this process.
+    pub fn kill_tree_scope(&self) -> KillTreeScope {
+        self.kill_tree_scope
+    }
+
     /// Forcefully terminate the child process.
     pub fn kill(&self) -> io::Result<()> {
+        // SAFETY: `process_handle` is owned by this process and remains open
+        // for the duration of this call.
         let ok = unsafe { TerminateProcess(self.process_handle.0, 1) };
         if ok == 0 {
             Err(io::Error::last_os_error())
         } else {
             Ok(())
+        }
+    }
+
+    /// Forcefully terminate the terminal workload.
+    ///
+    /// When [`Self::kill_tree_scope`] is [`KillTreeScope::WholeTree`], this
+    /// terminates the job containing the child and its descendants. It remains
+    /// valid after [`Self::wait`] because it targets an owned job handle; that
+    /// job is also terminated if this process value is dropped, unless the
+    /// workload has deliberately retained a handle to its own job.
+    ///
+    /// When the scope is [`KillTreeScope::DirectProcess`], containment was
+    /// unavailable at spawn time, so this falls back to terminating only the
+    /// direct child process.
+    pub fn kill_tree(&self) -> io::Result<()> {
+        if let Some(job_handle) = &self.job_handle {
+            // SAFETY: `job_handle` is owned by this process and remains open
+            // for the duration of this call.
+            let ok = unsafe { TerminateJobObject(job_handle.0, 1) };
+            if ok == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        } else {
+            self.kill()
         }
     }
 }
@@ -381,6 +461,164 @@ impl tokio::io::AsyncWrite for WinPtyWriter {
 // Spawn
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Create a job that tears down its members when its last handle closes.
+///
+/// Job containment is best-effort: Windows hosts may prohibit assigning a
+/// nested job. Callers can still use the PTY without it, with the resulting
+/// [`KillTreeScope`] exposing the narrower teardown guarantee.
+fn create_kill_on_close_job() -> Option<SendHandle> {
+    // SAFETY: null security attributes and name request default security and an
+    // unnamed job, as documented by CreateJobObjectW.
+    let job_handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job_handle.is_null() {
+        return None;
+    }
+    let job_handle = SendHandle(job_handle);
+    // SAFETY: zero initialization is valid for this POD Win32 structure; we
+    // set the one requested limit flag before passing it to Windows.
+    let mut job_limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    job_limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: `job_handle` is valid and `job_limits` is initialized and lives
+    // throughout this synchronous call.
+    let ok = unsafe {
+        SetInformationJobObject(
+            job_handle.0,
+            JobObjectExtendedLimitInformation,
+            &job_limits as *const _ as *const _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    (ok != 0).then_some(job_handle)
+}
+
+/// Create a process with its pseudoconsole and, when supplied, a job list.
+///
+/// The caller retries this without `job_handle` if the containment attempt
+/// fails. This observes the actual host policy instead of predicting it.
+fn create_process_with_attributes(
+    hpc: HPCON,
+    job_handle: Option<HANDLE>,
+    cmdline: &mut [u16],
+    cwd: *const u16,
+    environment: *const u16,
+    create_flags: PROCESS_CREATION_FLAGS,
+) -> io::Result<PROCESS_INFORMATION> {
+    let attribute_count = if job_handle.is_some() { 2 } else { 1 };
+    // UpdateProcThreadAttribute retains job-list values until the attribute
+    // list is destroyed, so this backing storage must outlive both
+    // CreateProcessW and DeleteProcThreadAttributeList below.
+    let job_handles: Option<[HANDLE; 1]> = job_handle.map(|handle| [handle]);
+    let mut attr_list_size: usize = 0;
+    // SAFETY: the documented sizing call accepts a null list pointer.
+    unsafe {
+        InitializeProcThreadAttributeList(
+            std::ptr::null_mut(),
+            attribute_count,
+            0,
+            &mut attr_list_size,
+        )
+    };
+    let mut attr_list_buf: Vec<u8> = vec![0; attr_list_size];
+    let attr_list = attr_list_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+    // SAFETY: the buffer size comes from the documented sizing call. Its
+    // alignment relies on the global allocator despite Vec<u8>'s alignment-1
+    // request; that assumption is tracked in issue #2.
+    let ok = unsafe {
+        InitializeProcThreadAttributeList(attr_list, attribute_count, 0, &mut attr_list_size)
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Pass the HPCON value as a pointer (not a pointer to its storage), as
+    // required by PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
+    // SAFETY: `attr_list` is initialized, and this documented attribute uses
+    // the HPCON value itself as `lpValue` rather than dereferencing it.
+    let pseudoconsole_ok = unsafe {
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            hpc as *const _,
+            std::mem::size_of::<HPCON>(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if pseudoconsole_ok == 0 {
+        let error = io::Error::last_os_error();
+        // SAFETY: `attr_list` was initialized successfully above.
+        unsafe { DeleteProcThreadAttributeList(attr_list) };
+        return Err(error);
+    }
+
+    if let Some(job_handles) = job_handles.as_ref() {
+        // The job-list value is an array of job handles, not a pointer to one
+        // handle. The function-scoped backing array remains alive until after
+        // DeleteProcThreadAttributeList has consumed the attribute list.
+        // SAFETY: `attr_list` is initialized, and `job_handles` remains valid
+        // through DeleteProcThreadAttributeList below. It contains the valid
+        // job handle supplied by the caller.
+        let job_ok = unsafe {
+            UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                job_handles.as_ptr() as *const _,
+                std::mem::size_of_val(job_handles),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if job_ok == 0 {
+            let error = io::Error::last_os_error();
+            // SAFETY: `attr_list` was initialized successfully above.
+            unsafe { DeleteProcThreadAttributeList(attr_list) };
+            return Err(error);
+        }
+    }
+
+    // SAFETY: zero initialization is valid for STARTUPINFOEXW. `attr_list`
+    // remains valid through CreateProcessW and is destroyed only afterward.
+    let mut si_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si_ex.lpAttributeList = attr_list;
+    // Set STARTF_USESTDHANDLES with INVALID_HANDLE_VALUE so the child does not
+    // inherit the parent's standard handles; the pseudoconsole supplies them.
+    si_ex.StartupInfo.dwFlags = 0x00000100; // STARTF_USESTDHANDLES
+    si_ex.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+    si_ex.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+    si_ex.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the command line, environment, startup info, output process
+    // information, and attribute-list backing values remain valid for this
+    // call. The attribute list is destroyed after CreateProcessW returns.
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            create_flags,
+            environment as *const _,
+            cwd,
+            &si_ex.StartupInfo,
+            &mut pi,
+        )
+    };
+    let result = if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(pi)
+    };
+    // SAFETY: `attr_list` was initialized successfully and CreateProcessW has
+    // returned, so it is no longer used.
+    unsafe { DeleteProcThreadAttributeList(attr_list) };
+    result
+}
+
 /// Spawn a command in a new ConPTY. Called by [`CommandBuilder::spawn`].
 pub async fn spawn(cmd: CommandBuilder) -> io::Result<WinPtyProcess> {
     task::spawn_blocking(move || spawn_sync(&cmd))
@@ -455,54 +693,10 @@ fn spawn_sync(cmd: &CommandBuilder) -> io::Result<WinPtyProcess> {
     drop(stdin_read);
     drop(stdout_write);
 
-    // ── 4. Initialize process thread attribute list ───────────────────────────
-    let mut attr_list_size: usize = 0;
-    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_list_size) };
-    let mut attr_list_buf: Vec<u8> = vec![0u8; attr_list_size];
-    let attr_list = attr_list_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-    let ok = unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size) };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // Pass the HPCON value AS a pointer (not a pointer TO the value).
-    // C equivalent: UpdateProcThreadAttribute(..., hPC, sizeof(HPCON), ...)
-    // where hPC is passed by value as PVOID.
-    let ok = unsafe {
-        UpdateProcThreadAttribute(
-            attr_list,
-            0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            hpc.val as *const _,
-            std::mem::size_of::<HPCON>(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        unsafe { DeleteProcThreadAttributeList(attr_list) };
-        return Err(io::Error::last_os_error());
-    }
-
-    // ── 5. Build STARTUPINFOEXW ───────────────────────────────────────────────
-    let mut si_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-    si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    si_ex.lpAttributeList = attr_list;
-    // CRITICAL: Set STARTF_USESTDHANDLES with INVALID_HANDLE_VALUE to prevent
-    // the child from inheriting the parent's std handles. In daemon mode
-    // (stdio:ignore), the parent has NUL handles which confuse the shell.
-    // The pseudoconsole provides the actual console handles to the child.
-    // (Ref: wezterm's ConPTY implementation uses this pattern.)
-    si_ex.StartupInfo.dwFlags = 0x00000100; // STARTF_USESTDHANDLES
-    si_ex.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-    si_ex.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
-    si_ex.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
-
-    // ── 6. Build command line (UTF-16) ────────────────────────────────────────
+    // ── 5. Build command line (UTF-16) ────────────────────────────────────────
     let cmdline = build_cmdline(&cmd.program, &cmd.args);
-    let mut cmdline_w: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
 
-    // ── 7. Build current directory (UTF-16) ──────────────────────────────────
+    // ── 8. Build current directory (UTF-16) ──────────────────────────────────
     // If no cwd provided, default to USERPROFILE or SYSTEMROOT to avoid
     // inheriting an invalid cwd (e.g. UNC path from WSL interop which causes
     // STATUS_DLL_NOT_FOUND / 0xC0000142 on cmd.exe).
@@ -520,7 +714,7 @@ fn spawn_sync(cmd: &CommandBuilder) -> io::Result<WinPtyProcess> {
         .map(|v| v.as_ptr())
         .unwrap_or(std::ptr::null());
 
-    // ── 8. Build environment block ───────────────────────────────────────────
+    // ── 9. Build environment block ───────────────────────────────────────────
     // ALWAYS build an explicit env block on Windows. When the agent runs under
     // WSL interop the inherited environment contains Linux-style PATH entries
     // that prevent child processes from finding system DLLs (STATUS_DLL_NOT_FOUND).
@@ -566,39 +760,44 @@ fn spawn_sync(cmd: &CommandBuilder) -> io::Result<WinPtyProcess> {
     let env_ptr = env_block.as_ptr();
     let create_flags: PROCESS_CREATION_FLAGS = EXTENDED_STARTUPINFO_PRESENT | 0x0000_0400u32;
 
-    // ── 10. CreateProcessW ────────────────────────────────────────────────────
-    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let ok = unsafe {
-        CreateProcessW(
-            std::ptr::null(),       // lpApplicationName (use cmdline)
-            cmdline_w.as_mut_ptr(), // lpCommandLine (mutable)
-            std::ptr::null(),       // lpProcessAttributes
-            std::ptr::null(),       // lpThreadAttributes
-            0,                      // bInheritHandles = FALSE
+    // ── 10. CreateProcessW, retrying without containment if necessary ────────
+    let create_process = |job_handle| {
+        // CreateProcessW may modify its command-line buffer, so every attempt
+        // starts from the same original command line.
+        let mut cmdline_w: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+        create_process_with_attributes(
+            hpc.val,
+            job_handle,
+            &mut cmdline_w,
+            cwd_ptr,
+            env_ptr,
             create_flags,
-            env_ptr as *const _, // lpEnvironment
-            cwd_ptr,             // lpCurrentDirectory
-            &si_ex.StartupInfo,  // lpStartupInfo (STARTUPINFOEX)
-            &mut pi,             // lpProcessInformation
         )
     };
+    let containment_job = create_kill_on_close_job();
+    let (pi, job_handle, kill_tree_scope) = match containment_job {
+        Some(job_handle) => match create_process(Some(job_handle.0)) {
+            Ok(pi) => (pi, Some(job_handle), KillTreeScope::WholeTree),
+            // A host job can reject nesting. Retry the actual spawn without a
+            // job instead of attempting to predict that policy in advance.
+            Err(_) => (create_process(None)?, None, KillTreeScope::DirectProcess),
+        },
+        None => (create_process(None)?, None, KillTreeScope::DirectProcess),
+    };
 
-    unsafe { DeleteProcThreadAttributeList(attr_list) };
-
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
+    // SAFETY: CreateProcessW returned this thread handle, which is no longer
+    // needed after process creation has completed.
     unsafe { CloseHandle(pi.hThread) };
 
     // (diagnostics removed)
 
     // Watcher: close pseudoconsole when child exits
+    let process_handle = SendHandle(pi.hProcess);
     {
         let hpc_watcher = Arc::clone(&hpc);
-        let child_handle = handle_as_usize(pi.hProcess);
+        let watcher_handle = duplicate_handle(process_handle.0)?;
         task::spawn_blocking(move || {
-            unsafe { WaitForSingleObject(usize_as_handle(child_handle), INFINITE) };
+            let _ = wait_for_exit(watcher_handle);
             hpc_watcher.close();
         });
     }
@@ -700,7 +899,9 @@ fn spawn_sync(cmd: &CommandBuilder) -> io::Result<WinPtyProcess> {
 
     Ok(WinPtyProcess {
         hpc,
-        process_handle: SendHandle(pi.hProcess),
+        process_handle,
+        job_handle,
+        kill_tree_scope,
         process_id: pi.dwProcessId,
         output_rx: Arc::new(tokio::sync::Mutex::new(stdout_rx)),
         input_tx: stdin_tx,
