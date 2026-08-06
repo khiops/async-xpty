@@ -85,5 +85,5 @@ be dual licensed as above, without any additional terms or conditions.
 ## History
 
 `async-xpty` was originally developed inside the
-[termora](https://github.com/khiops/termora) monorepo and extracted to its own
+[lasterm](https://github.com/khiops/lasterm) monorepo and extracted to its own
 repository (with history) to live as a standalone, independently-versioned library.
