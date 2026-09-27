@@ -104,6 +104,11 @@ impl CommandBuilder {
     /// and an empty signal mask, whatever this process ignores or blocks. The
     /// Rust runtime ignores `SIGPIPE`; the program in the PTY does not.
     ///
+    /// On Linux and macOS, the PTY starts with `IUTF8` set, as in a UTF-8
+    /// terminal emulator: in canonical mode, erasing removes a whole UTF-8
+    /// character, not one byte. If the flag cannot be set, the spawn goes on
+    /// without it.
+    ///
     /// # Errors
     ///
     /// Returns an error if the PTY cannot be created, the process cannot be

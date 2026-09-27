@@ -355,6 +355,26 @@ async fn test_child_starts_with_no_ignored_or_blocked_signal() {
     }
 }
 
+/// The PTY starts with `IUTF8` (lasterm#601). Without it, Backspace over a
+/// multibyte character in canonical mode erases only its last byte.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[tokio::test]
+async fn test_pty_starts_with_iutf8() {
+    let mut pty = CommandBuilder::new("stty").arg("-a").spawn().await.unwrap();
+    let (output, status) = output_and_status(&mut pty).await;
+
+    assert!(
+        status.success(),
+        "stty -a failed: {status}, output {output:?}"
+    );
+    let flags: Vec<&str> = output.split_whitespace().collect();
+    assert!(
+        !flags.contains(&"-iutf8"),
+        "the PTY started without IUTF8: {output:?}"
+    );
+    assert!(flags.contains(&"iutf8"), "no iutf8 in stty -a: {output:?}");
+}
+
 /// Verify `ExitStatus` convenience methods.
 #[test]
 fn test_exit_status_api() {
