@@ -100,6 +100,10 @@ impl CommandBuilder {
 
     /// Spawn the command inside a new PTY and return a [`PtyProcess`].
     ///
+    /// On Unix, the child starts with every signal at its default disposition
+    /// and an empty signal mask, whatever this process ignores or blocks. The
+    /// Rust runtime ignores `SIGPIPE`; the program in the PTY does not.
+    ///
     /// # Errors
     ///
     /// Returns an error if the PTY cannot be created, the process cannot be

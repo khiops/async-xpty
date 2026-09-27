@@ -5,6 +5,8 @@
 #![cfg(test)]
 #![cfg(unix)]
 
+use std::mem::MaybeUninit;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{CommandBuilder, PtySize};
@@ -207,6 +209,150 @@ async fn test_env_clear() {
         "expected empty HOME in {:?}",
         output
     );
+}
+
+/// Run a one-shot PTY command to its end: everything it printed, then how it
+/// ended.
+async fn output_and_status(pty: &mut crate::PtyProcess) -> (String, crate::ExitStatus) {
+    let mut output = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        pty.reader().read_to_end(&mut output),
+    )
+    .await
+    .expect("read timed out")
+    .expect("read error");
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), pty.wait())
+        .await
+        .expect("wait timed out")
+        .expect("wait error");
+
+    (String::from_utf8_lossy(&output).into_owned(), status)
+}
+
+/// Blocks one signal in the calling thread until dropped.
+struct BlockedInThisThread {
+    previous: libc::sigset_t,
+}
+
+impl BlockedInThisThread {
+    fn new(signal: libc::c_int) -> Self {
+        // SAFETY: both sets are initialised before use, by `sigemptyset` and
+        // by `pthread_sigmask` writing the previous mask.
+        unsafe {
+            let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+            libc::sigemptyset(set.as_mut_ptr());
+            libc::sigaddset(set.as_mut_ptr(), signal);
+            let mut previous = MaybeUninit::<libc::sigset_t>::uninit();
+            let rc = libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), previous.as_mut_ptr());
+            assert_eq!(rc, 0, "pthread_sigmask(SIG_BLOCK) failed");
+            Self {
+                previous: previous.assume_init(),
+            }
+        }
+    }
+}
+
+impl Drop for BlockedInThisThread {
+    fn drop(&mut self) {
+        // SAFETY: restores the mask saved by `new`. The tests drop the guard
+        // on the thread that created it.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut()) };
+    }
+}
+
+/// The child does not inherit the parent's ignored `SIGPIPE` (lasterm#597).
+///
+/// With it, `yes | head -1` in the terminal printed a write error instead of
+/// `yes` dying quietly. Here the shell sends itself `SIGPIPE`: it must die of
+/// it, not go on to print `alive`.
+#[tokio::test]
+async fn test_child_does_not_inherit_ignored_sigpipe() {
+    // The Rust runtime already ignores SIGPIPE; ignoring it again keeps the
+    // test independent of that and changes nothing for this process.
+    // SAFETY: SIG_IGN installs no handler.
+    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    assert_ne!(previous, libc::SIG_ERR, "could not ignore SIGPIPE");
+
+    let mut pty = CommandBuilder::new("/bin/sh")
+        .arg("-c")
+        .arg("kill -PIPE $$; echo alive")
+        .spawn()
+        .await
+        .unwrap();
+    let (output, status) = output_and_status(&mut pty).await;
+
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGPIPE),
+        "expected the shell to die of SIGPIPE, got {status}, output {output:?}"
+    );
+    assert!(!output.contains("alive"), "SIGPIPE was ignored: {output:?}");
+}
+
+/// The child starts with an empty signal mask, whatever the spawning thread
+/// blocks: a shell that sends itself a signal blocked in the parent dies.
+// current_thread: the spawn, and so the fork, runs on this thread.
+#[tokio::test(flavor = "current_thread")]
+async fn test_child_does_not_inherit_blocked_signals() {
+    let blocked = BlockedInThisThread::new(libc::SIGUSR1);
+    let spawned = CommandBuilder::new("/bin/sh")
+        .arg("-c")
+        .arg("kill -USR1 $$; echo alive")
+        .spawn()
+        .await;
+    drop(blocked);
+    let mut pty = spawned.unwrap();
+    let (output, status) = output_and_status(&mut pty).await;
+
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGUSR1),
+        "expected the shell to die of SIGUSR1, got {status}, output {output:?}"
+    );
+    assert!(
+        !output.contains("alive"),
+        "SIGUSR1 stayed blocked: {output:?}"
+    );
+}
+
+/// Every disposition is reset, not only `SIGPIPE`, and the mask is empty: the
+/// program the child runs reports no ignored and no blocked signal.
+#[cfg(target_os = "linux")]
+// current_thread: the spawn, and so the fork, runs on this thread.
+#[tokio::test(flavor = "current_thread")]
+async fn test_child_starts_with_no_ignored_or_blocked_signal() {
+    // SIGURG's default action is to ignore it, so ignoring it explicitly
+    // changes nothing for this process, yet shows in SigIgn if inherited.
+    // SAFETY: SIG_IGN installs no handler.
+    let previous = unsafe { libc::signal(libc::SIGURG, libc::SIG_IGN) };
+    assert_ne!(previous, libc::SIG_ERR, "could not ignore SIGURG");
+    let blocked = BlockedInThisThread::new(libc::SIGUSR2);
+
+    let spawned = CommandBuilder::new("cat")
+        .arg("/proc/self/status")
+        .spawn()
+        .await;
+    drop(blocked);
+    // SAFETY: puts back the disposition read above.
+    unsafe { libc::signal(libc::SIGURG, previous) };
+    let mut pty = spawned.unwrap();
+    let (output, status) = output_and_status(&mut pty).await;
+
+    assert!(status.success(), "cat failed: {status}, output {output:?}");
+    for field in ["SigIgn:", "SigBlk:"] {
+        let value = output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(field))
+            .map(str::trim)
+            .unwrap_or_else(|| panic!("no {field} line in {output:?}"));
+        assert_eq!(
+            u64::from_str_radix(value, 16),
+            Ok(0),
+            "{field} {value} in the child, expected none"
+        );
+    }
 }
 
 /// Verify `ExitStatus` convenience methods.

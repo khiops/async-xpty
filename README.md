@@ -58,6 +58,9 @@ async fn main() -> std::io::Result<()> {
 ## Platform notes
 
 - **Resize** sends `SIGWINCH` to the process group on Unix; calls `ResizePseudoConsole` on Windows.
+- **Signals** on Unix: the child starts with every signal at its default
+  disposition and an empty signal mask, whatever the spawning process ignores
+  or blocks. The Rust runtime ignores `SIGPIPE`; the program in the PTY does not.
 - **`kill_tree_scope()`** reports whether `kill_tree()` reaches a Windows job's
   whole tree, the child's Unix process group, or only a direct Windows child.
   The whole-tree scope remains valid after `wait()` and is torn down when its
