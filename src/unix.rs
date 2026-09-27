@@ -3,7 +3,8 @@
 //! # Fork/exec flow
 //!
 //! 1. `openpty()` creates master/slave fd pair with the requested window size.
-//! 2. `fork()` — child sets up stdio on slave fd and calls `execvp`.
+//! 2. `fork()` — child resets its signal state, sets up stdio on slave fd and
+//!    calls `execvp`.
 //! 3. Parent closes slave fd, sets master non-blocking, wraps in `AsyncFd`.
 
 use std::collections::HashMap;
@@ -422,6 +423,9 @@ pub async fn spawn(cmd: CommandBuilder) -> io::Result<UnixPtyProcess> {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
+    // Also before the fork: the child's signal reset only makes syscalls.
+    let signal_reset = ChildSignalReset::prepare();
+
     // ── 2. Use a pipe to propagate exec errors from child to parent ───────────
     // We create a CLOEXEC pipe: child writes errno on exec failure, parent
     // reads it. If exec succeeds the write end is closed by CLOEXEC and the
@@ -453,6 +457,7 @@ pub async fn spawn(cmd: CommandBuilder) -> io::Result<UnixPtyProcess> {
                 libc::close(pipe_read);
 
                 child_setup(
+                    &signal_reset,
                     slave_owned_raw,
                     pipe_write,
                     &argv_ptrs,
@@ -546,13 +551,98 @@ unsafe fn set_environ(envp: *const *const libc::c_char) {
     *libc::_NSGetEnviron() = envp as *mut *mut libc::c_char;
 }
 
-/// Child-side setup: session, controlling terminal, stdio, env, exec.
+/// The signal state a PTY child starts from: every disposition at `SIG_DFL`
+/// and an empty signal mask.
+///
+/// `fork()` copies the parent's dispositions and the forking thread's mask,
+/// and `execvp` keeps both, except that caught signals revert to `SIG_DFL`.
+/// So a signal the parent ignores stays ignored in the program the child
+/// runs, and in everything that program runs. The Rust runtime ignores
+/// `SIGPIPE`: without this reset, a command in the terminal whose reader goes
+/// away gets `EPIPE` and prints a write error instead of dying quietly
+/// (`yes | head -1`). Other ignored signals (`SIGHUP` under `nohup`,
+/// `SIGQUIT`, `SIGCHLD`) and blocked ones would leak the same way.
+/// `std::process::Command` resets `SIGPIPE` and the mask for this reason. A
+/// terminal's shell should start as it would over `ssh`, so everything is
+/// reset here, not only `SIGPIPE`.
+///
+/// Built before `fork()`, so the child only makes syscalls.
+struct ChildSignalReset {
+    default_action: libc::sigaction,
+    empty_mask: libc::sigset_t,
+    last_signal: libc::c_int,
+}
+
+impl ChildSignalReset {
+    fn prepare() -> Self {
+        // SAFETY: an all-zero `sigaction` is a valid value (no flags, handler
+        // 0 == SIG_DFL), and `sigemptyset` initialises the set it is given.
+        unsafe {
+            let mut empty_mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            libc::sigemptyset(empty_mask.as_mut_ptr());
+            let empty_mask = empty_mask.assume_init();
+
+            let mut default_action: libc::sigaction = std::mem::zeroed();
+            default_action.sa_sigaction = libc::SIG_DFL;
+            default_action.sa_mask = empty_mask;
+
+            Self {
+                default_action,
+                empty_mask,
+                last_signal: last_signal_number(),
+            }
+        }
+    }
+
+    /// Reset every disposition, then clear the mask.
+    ///
+    /// Dispositions go first: once the mask is cleared, a signal that arrives
+    /// must find `SIG_DFL`, never a handler copied from the parent.
+    ///
+    /// # Safety
+    ///
+    /// Child side of `fork()` only. `sigaction` and `sigprocmask` are
+    /// async-signal-safe, and nothing here allocates.
+    unsafe fn apply(&self) -> io::Result<()> {
+        for signal in 1..=self.last_signal {
+            if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+                continue;
+            }
+            // Numbers the C library reserves (glibc's 32 and 33) or that
+            // this system does not have fail with EINVAL: nothing to reset.
+            libc::sigaction(signal, &self.default_action, std::ptr::null_mut());
+        }
+        if libc::sigprocmask(libc::SIG_SETMASK, &self.empty_mask, std::ptr::null_mut()) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// The highest signal number, real-time signals included.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn last_signal_number() -> libc::c_int {
+    libc::SIGRTMAX()
+}
+
+/// The highest signal number, real-time signals included.
+///
+/// `libc` exports no `NSIG` here. 128 covers every BSD (FreeBSD's `SIGRTMAX`
+/// is 126; macOS stops at 31), and `sigaction` rejects numbers past the last
+/// signal with EINVAL, which `ChildSignalReset::apply` ignores.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn last_signal_number() -> libc::c_int {
+    128
+}
+
+/// Child-side setup: signals, session, controlling terminal, stdio, env, exec.
 ///
 /// # Safety
 ///
 /// Must be called only in the child process after `fork()`. Must not allocate
 /// memory or call non-async-signal-safe functions except via libc.
 unsafe fn child_setup(
+    signal_reset: &ChildSignalReset,
     slave_fd: RawFd,
     pipe_write: RawFd,
     argv_ptrs: &[*const libc::c_char],
@@ -565,6 +655,12 @@ unsafe fn child_setup(
             libc::write(pipe_write, e.as_ptr() as *const libc::c_void, 4);
             libc::_exit(1);
         }};
+    }
+
+    // Signals first, so that no handler inherited from the parent can run
+    // in the child during the setup below.
+    if let Err(error) = signal_reset.apply() {
+        die!(error.raw_os_error().unwrap_or(libc::EINVAL));
     }
 
     // New session — become session leader
