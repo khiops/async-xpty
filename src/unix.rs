@@ -2,7 +2,8 @@
 //!
 //! # Fork/exec flow
 //!
-//! 1. `openpty()` creates master/slave fd pair with the requested window size.
+//! 1. `openpty()` creates master/slave fd pair with the requested window size,
+//!    then `IUTF8` is set on it where the system has the flag.
 //! 2. `fork()` — child resets its signal state, sets up stdio on slave fd and
 //!    calls `execvp`.
 //! 3. Parent closes slave fd, sets master non-blocking, wraps in `AsyncFd`.
@@ -58,6 +59,39 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Set `IUTF8` on a new PTY: its line discipline then treats input as UTF-8.
+///
+/// Without it, the kernel erases bytes, not characters. In canonical mode
+/// (`read`, `cat`, a password prompt: anything that reads a line without a
+/// line editor of its own), Backspace over `é` or `€` erases only its last
+/// byte and leaves broken UTF-8 in the line. `openpty` does not set it on
+/// Linux or macOS; terminal emulators do for a UTF-8 session, and `ssh` from
+/// a UTF-8 client passes it on.
+///
+/// Best effort: if the flags cannot be read or written, the PTY keeps the
+/// system's defaults and the spawn goes on. Only erasing a multibyte
+/// character in canonical mode differs, which is no reason to refuse a
+/// terminal, and on a PTY that `openpty` just opened neither call is expected
+/// to fail.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn enable_utf8_input(slave: RawFd) {
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `slave` is an open terminal fd. `termios` is read only after
+    // `tcgetattr` returned 0, which means it filled the struct.
+    unsafe {
+        if libc::tcgetattr(slave, termios.as_mut_ptr()) != 0 {
+            return;
+        }
+        let mut termios = termios.assume_init();
+        termios.c_iflag |= libc::IUTF8;
+        libc::tcsetattr(slave, libc::TCSANOW, &termios);
+    }
+}
+
+/// `libc` has no `IUTF8` for this system: the PTY keeps its default flags.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn enable_utf8_input(_slave: RawFd) {}
 
 /// Close all file descriptors >= 3 in the child process, except those in
 /// `keep`.
@@ -363,6 +397,8 @@ pub async fn spawn(cmd: CommandBuilder) -> io::Result<UnixPtyProcess> {
     // ── 1. Open PTY pair ──────────────────────────────────────────────────────
     let result =
         nix::pty::openpty(Some(&ws), None).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    // Before the fork, so the child's program never sees the PTY without it.
+    enable_utf8_input(result.slave.as_raw_fd());
 
     // Detach ownership from nix so we can close fds manually after fork.
     let master_owned_raw = result.master.into_raw_fd();

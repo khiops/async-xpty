@@ -61,6 +61,10 @@ async fn main() -> std::io::Result<()> {
 - **Signals** on Unix: the child starts with every signal at its default
   disposition and an empty signal mask, whatever the spawning process ignores
   or blocks. The Rust runtime ignores `SIGPIPE`; the program in the PTY does not.
+- **UTF-8 input** on Linux and macOS: the PTY starts with `IUTF8` set, as in a
+  UTF-8 terminal emulator, so Backspace in canonical mode (`read`, a password
+  prompt) erases a whole multibyte character, not its last byte. If the flag
+  cannot be set, the spawn goes on without it.
 - **`kill_tree_scope()`** reports whether `kill_tree()` reaches a Windows job's
   whole tree, the child's Unix process group, or only a direct Windows child.
   The whole-tree scope remains valid after `wait()` and is torn down when its
