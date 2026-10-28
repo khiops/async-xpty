@@ -131,10 +131,11 @@ struct MasterFd {
 impl MasterFd {
     fn new(fd: OwnedFd) -> io::Result<Self> {
         set_nonblocking(fd.as_raw_fd())?;
-        // Safety: fd is valid and non-blocking.
-        Ok(Self {
-            fd: tokio::io::unix::AsyncFd::new(fd)?,
-        })
+        // SAFETY: the `OwnedFd` is open, `as_raw_fd` always returns the same
+        // descriptor, and it closes only when dropped, which happens no
+        // earlier than the `AsyncFd` that owns it.
+        let fd = unsafe { tokio::io::unix::AsyncFd::register(fd) }?;
+        Ok(Self { fd })
     }
 
     fn raw(&self) -> RawFd {
