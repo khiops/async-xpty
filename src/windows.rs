@@ -253,11 +253,10 @@ impl WinPtyProcess {
     ///
     /// Backed by a background `spawn_blocking` thread started at spawn time
     /// that drains a tokio mpsc channel into the ConPTY stdin pipe.
-    /// `mpsc::Sender` is `Clone`, so multiple writers coexist safely.
+    /// Each writer sends through its own clone of the `mpsc::Sender`, so
+    /// multiple writers coexist safely.
     pub fn writer(&self) -> WinPtyWriter {
-        WinPtyWriter {
-            tx: self.input_tx.clone(),
-        }
+        WinPtyWriter::new(self.input_tx.clone())
     }
 
     /// Resize the ConPTY window.
@@ -416,9 +415,18 @@ impl tokio::io::AsyncRead for WinPtyReader {
 /// Async writer for the ConPTY child's stdin.
 ///
 /// Backed by a tokio mpsc channel drained by a `spawn_blocking` thread.
-/// `mpsc::Sender` is `Clone`, so multiple `WinPtyWriter` instances coexist.
+/// Each `WinPtyWriter` holds its own sender and reservation state, so
+/// multiple instances coexist.
 pub struct WinPtyWriter {
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    tx: tokio_util::sync::PollSender<Vec<u8>>,
+}
+
+impl WinPtyWriter {
+    fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            tx: tokio_util::sync::PollSender::new(tx),
+        }
+    }
 }
 
 impl tokio::io::AsyncWrite for WinPtyWriter {
@@ -427,18 +435,22 @@ impl tokio::io::AsyncWrite for WinPtyWriter {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        // `try_send` is non-blocking. If the channel is full, wake immediately
-        // and return Pending so the runtime retries. The channel has capacity 64
-        // and carries keyboard input chunks, so saturation is rare.
-        match self.tx.try_send(buf.to_vec()) {
-            Ok(()) => std::task::Poll::Ready(Ok(buf.len())),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => std::task::Poll::Ready(Err(
-                io::Error::new(io::ErrorKind::BrokenPipe, "stdin channel closed"),
-            )),
+        // Reserve a slot first, then send. While the channel is full,
+        // `poll_reserve` registers the waker and returns Pending, and the task
+        // sleeps until the stdin thread frees a slot. The channel can stay full
+        // for a long time: ConPTY takes no input while its own output is
+        // blocked, so a consumer that stops reading the output also stops the
+        // input (#10). Nothing is queued before Ready, so a write the caller
+        // abandons sends nothing.
+        let tx = &mut self.get_mut().tx;
+        let closed = || io::Error::new(io::ErrorKind::BrokenPipe, "stdin channel closed");
+        match tx.poll_reserve(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(closed())),
+            std::task::Poll::Ready(Ok(())) => match tx.send_item(buf.to_vec()) {
+                Ok(()) => std::task::Poll::Ready(Ok(buf.len())),
+                Err(_) => std::task::Poll::Ready(Err(closed())),
+            },
         }
     }
 
@@ -956,4 +968,91 @@ fn build_env_block(env: &std::collections::HashMap<String, String>) -> Vec<u16> 
     }
     block.push(0); // double-null to terminate the block
     block
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::Duration;
+
+    use tokio::io::AsyncWrite;
+    use tokio::sync::mpsc;
+
+    use super::WinPtyWriter;
+
+    /// Counts wake-ups. Each one asks the runtime to poll the task again.
+    struct CountingWaker(AtomicUsize);
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A stdin channel holding one chunk the stdin thread has not taken yet.
+    /// ConPTY takes no input while its own output is blocked, so in practice
+    /// the channel stays full until somebody reads the output (#10).
+    fn full_channel() -> (WinPtyWriter, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        tx.try_send(b"queued".to_vec()).unwrap();
+        (WinPtyWriter::new(tx), rx)
+    }
+
+    #[test]
+    fn write_to_a_full_channel_waits_without_waking_itself() {
+        let (mut writer, mut rx) = full_channel();
+        let wakes = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut writer)
+            .poll_write(&mut cx, b"input")
+            .is_pending());
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            0,
+            "a pending write must not ask to be polled again while the channel stays full"
+        );
+
+        // The stdin thread takes the queued chunk: a slot frees and the
+        // writer is woken once.
+        assert_eq!(rx.try_recv().unwrap(), b"queued");
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+
+        match Pin::new(&mut writer).poll_write(&mut cx, b"input") {
+            Poll::Ready(Ok(n)) => assert_eq!(n, b"input".len()),
+            other => panic!("expected the write to complete, got {other:?}"),
+        }
+        assert_eq!(rx.try_recv().unwrap(), b"input");
+    }
+
+    #[tokio::test]
+    async fn write_task_is_not_polled_again_until_a_slot_frees() {
+        let (mut writer, mut rx) = full_channel();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let task_polls = Arc::clone(&polls);
+        let task = tokio::spawn(std::future::poll_fn(move |cx| {
+            task_polls.fetch_add(1, Ordering::SeqCst);
+            Pin::new(&mut writer).poll_write(cx, b"input")
+        }));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the write task spun while the channel was full"
+        );
+
+        assert_eq!(rx.recv().await.unwrap(), b"queued");
+        assert_eq!(task.await.unwrap().unwrap(), b"input".len());
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(rx.recv().await.unwrap(), b"input");
+    }
 }
